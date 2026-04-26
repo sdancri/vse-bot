@@ -5,7 +5,7 @@
 
 services:
   VSE_1:
-    image: sdancri/vse:latest
+    image: sdancri/vse_1:latest
     pull_policy: always
     container_name: VSE_1
     restart: unless-stopped
@@ -31,7 +31,7 @@ services:
       start_period: 45s
 
   VSE_2:
-    image: sdancri/vse:latest
+    image: sdancri/vse_2:latest
     pull_policy: always
     container_name: VSE_2
     restart: unless-stopped

@@ -6,7 +6,7 @@
 
 services:
   VSE_2:
-    image: sdancri/vse:latest
+    image: sdancri/vse_2:latest
     pull_policy: always
     container_name: VSE_2
     restart: unless-stopped
