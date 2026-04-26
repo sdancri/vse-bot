@@ -1,0 +1,250 @@
+// © sdancri — VSE Balanced strategy verifier (Pine v6)
+//
+// Simulează FULL trade lifecycle (entry + TS exit + OPP exit) pe TradingView,
+// fidel cu vse_bot Python. Folosește pentru CROSS-CHECK trade-uri vs bot live.
+//
+// Match cu botul:
+//   - 6 indicatori (McGinley, White Line, TTM Squeeze, Tether, Vortex, SuperTrend)
+//   - Style "Balanced": baseline + 2-of-3 + TTMS edge-trigger
+//   - Entry pe NEXT BAR OPEN (process_orders_on_close=false default)
+//   - TS exit intra-bar la trailing stop hit (strategy.exit stop=)
+//   - OPP exit la NEXT BAR OPEN pe opposite raw signal (strategy.close)
+//   - Cooldown 3 bars post-EXIT
+//   - Sizing: risk_usd = 20% × equity, pos = risk / sl_pct, capped 0.95 × equity × 20
+//   - Fees taker 0.055% (commission_value)
+//
+// TradingView Strategy Tester va afișa:
+//   - Lista trade-uri cu entry/exit price, PnL, reason
+//   - Equity curve
+//   - Win rate, PF, drawdown
+//   - Pe chart: ▲L/▼S markeri entry, ✗ markeri exit
+//
+// Limitări (acceptable pt cross-check):
+//   - Pine strategy() rulează 1 simbol (rulezi separat per pereche)
+//   - Cycle reset / SUCCESS NU sunt simulate (Pine nu poate restart equity mid-run)
+//   - State Bybit (real PnL fetch) NU se aplică — Pine folosește prețul natural
+
+//@version=6
+strategy(
+     "VSE Balanced — verify (entries+exits)",
+     overlay              = true,
+     initial_capital      = 100.0,
+     default_qty_type     = strategy.cash,
+     default_qty_value    = 0,                     // override per entry via qty=
+     pyramiding           = 0,
+     process_orders_on_close = false,              // execută la NEXT BAR OPEN (match bot)
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.055,                  // taker fee 0.055%
+     calc_on_every_tick   = false,
+     max_labels_count     = 500,
+     max_lines_count      = 500
+ )
+
+// ========== INPUTS ==========
+g_ind = "Indicators (default match bot)"
+mcg_len   = input.int(14, "McGinley Length",   group=g_ind)
+wl_len    = input.int(20, "White Line Length", group=g_ind)
+ttms_len  = input.int(20, "TTMS Length",       group=g_ind)
+ttms_bb   = input.float(2.0, "TTMS BB Mult",   group=g_ind, step=0.1)
+ttms_kc   = input.float(2.0, "TTMS KC Mult Widest", group=g_ind, step=0.1)
+teth_f    = input.int(13, "Tether Fast",       group=g_ind)
+teth_s    = input.int(55, "Tether Slow",       group=g_ind)
+vor_len   = input.int(14, "Vortex Length",     group=g_ind)
+vor_thr   = input.float(0.05, "Vortex Threshold", group=g_ind, step=0.01)
+st_len    = input.int(22, "SuperTrend ATR Length", group=g_ind)
+st_mult   = input.float(3.0, "SuperTrend Mult",    group=g_ind, step=0.1)
+st_wicks  = input.bool(true, "SuperTrend Use Wicks (high/low)", group=g_ind)
+
+g_filt = "Entry Filters"
+sl_min_pct  = input.float(0.005, "SL min %", group=g_filt, step=0.001)
+sl_max_pct  = input.float(0.035, "SL max %", group=g_filt, step=0.001)
+cooldown    = input.int(3,    "Cooldown bars (post-EXIT)", group=g_filt)
+
+g_size = "Sizing (match bot Nou1)"
+risk_pct       = input.float(0.20, "Risk % of equity", group=g_size, step=0.01)
+leverage       = input.int(20,    "Leverage", group=g_size)
+cap_pct_of_max = input.float(0.95, "Cap %% of max", group=g_size, step=0.01)
+
+
+// ========== 1. McGINLEY DYNAMIC ==========
+var float mg = na
+ema_seed = ta.ema(close, mcg_len)
+if na(mg[1]) or mg[1] == 0
+    mg := ema_seed
+else
+    ratio = close / mg[1]
+    denom = mcg_len * math.pow(ratio, 4)
+    mg := denom == 0 or na(denom) ? mg[1] : mg[1] + (close - mg[1]) / denom
+baseline       = mg
+baseline_trend = close > baseline ? 1 : close < baseline ? -1 : 0
+
+
+// ========== 2. WHITE LINE ==========
+white_line = (ta.highest(high, wl_len) + ta.lowest(low, wl_len)) / 2
+
+
+// ========== 3. TTM SQUEEZE ==========
+basis = ta.sma(close, ttms_len)
+dev   = ta.stdev(close, ttms_len)
+bb_up = basis + ttms_bb * dev
+bb_dn = basis - ttms_bb * dev
+tr_v  = ta.tr(true)
+kc_dev= ta.sma(tr_v, ttms_len)
+kc_up = basis + kc_dev * ttms_kc
+kc_dn = basis - kc_dev * ttms_kc
+no_squeeze = bb_dn < kc_dn or bb_up > kc_up
+
+hh        = ta.highest(high, ttms_len)
+ll        = ta.lowest(low,  ttms_len)
+price_avg = ((hh + ll) / 2 + basis) / 2
+diff      = close - price_avg
+ttms_mom  = ta.linreg(diff, ttms_len, 0)
+
+mom_prev  = ttms_mom[1]
+ttms_l_b  = ttms_mom > 0 and ttms_mom > mom_prev
+ttms_s_b  = ttms_mom < 0 and ttms_mom < mom_prev
+
+ttms_l_sig = ttms_l_b and no_squeeze
+ttms_s_sig = ttms_s_b and no_squeeze
+
+ttms_l_fin = ttms_l_sig and not ttms_l_sig[1]
+ttms_s_fin = ttms_s_sig and not ttms_s_sig[1]
+
+
+// ========== 4. TETHER LINE ==========
+teth_fast_v = (ta.highest(high, teth_f) + ta.lowest(low, teth_f)) / 2
+teth_slow_v = (ta.highest(high, teth_s) + ta.lowest(low, teth_s)) / 2
+tether_long  = teth_fast_v > teth_slow_v and close > teth_slow_v
+tether_short = teth_fast_v < teth_slow_v and close < teth_slow_v
+
+
+// ========== 5. VORTEX ==========
+vm_plus  = math.abs(high - low[1])
+vm_minus = math.abs(low  - high[1])
+vplus    = math.sum(vm_plus,  vor_len)
+vminus   = math.sum(vm_minus, vor_len)
+sum_tr   = math.sum(tr_v,     vor_len)
+vi_plus  = vplus  / sum_tr
+vi_minus = vminus / sum_tr
+vortex_long  = (vi_plus  - vi_minus) > vor_thr
+vortex_short = (vi_minus - vi_plus)  > vor_thr
+
+
+// ========== 6. SUPERTREND ==========
+hl2_v  = (high + low) / 2
+atr_st = ta.atr(st_len)
+sdv    = st_mult * atr_st
+hp     = st_wicks ? high : close
+lp     = st_wicks ? low  : close
+
+var float st_long  = na
+var float st_short = na
+var int   st_dir   = 1
+
+cl_v = hl2_v - sdv
+cs_v = hl2_v + sdv
+pls  = nz(st_long[1],  cl_v)
+pss  = nz(st_short[1], cs_v)
+plo  = nz(lp[1], lp)
+phi  = nz(hp[1], hp)
+
+st_long  := plo > pls ? math.max(cl_v, pls) : cl_v
+st_short := phi < pss ? math.min(cs_v, pss) : cs_v
+
+if st_dir == -1 and hp > pss
+    st_dir := 1
+else if st_dir == 1 and lp < pls
+    st_dir := -1
+
+
+// ========== BUILD RAW SIGNALS (Balanced) ==========
+bl_up = baseline_trend ==  1
+bl_dn = baseline_trend == -1
+
+count_l = (ttms_l_fin ? 1 : 0) + (tether_long  ? 1 : 0) + (vortex_long  ? 1 : 0)
+count_s = (ttms_s_fin ? 1 : 0) + (tether_short ? 1 : 0) + (vortex_short ? 1 : 0)
+
+raw_long  = bl_up and count_l >= 2 and ttms_l_fin
+raw_short = bl_dn and count_s >= 2 and ttms_s_fin
+
+
+// ========== ENTRY/EXIT LOGIC ==========
+var int   last_exit_bar = na
+var float trail_stop    = na
+var float entry_sl      = na
+
+in_long  = strategy.position_size > 0
+in_short = strategy.position_size < 0
+in_pos   = in_long or in_short
+
+cooldown_ok = na(last_exit_bar) or (bar_index - last_exit_bar) >= cooldown
+indicators_ready = not na(atr_st) and not na(st_long) and not na(st_short)
+
+sl_long_dist  = (close - st_long)  / close
+sl_short_dist = (st_short - close) / close
+
+valid_entry_long  = raw_long  and not in_pos and cooldown_ok and indicators_ready and st_long  < close and sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct
+valid_entry_short = raw_short and not in_pos and cooldown_ok and indicators_ready and st_short > close and sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pct
+
+// === Sizing (match bot: pos = risk × 100 / sl_pct, capped 0.95 × equity × lev) ===
+risk_usd  = strategy.equity * risk_pct
+max_bybit = strategy.equity * leverage
+cap_value = cap_pct_of_max * max_bybit
+
+pos_long  = sl_long_dist  > 0 ? math.min(risk_usd / sl_long_dist,  cap_value) : 0
+pos_short = sl_short_dist > 0 ? math.min(risk_usd / sl_short_dist, cap_value) : 0
+
+qty_long  = close > 0 ? pos_long  / close : 0
+qty_short = close > 0 ? pos_short / close : 0
+
+
+// === ENTRY ===
+if valid_entry_long
+    strategy.entry("L", strategy.long, qty=qty_long, comment="L")
+    entry_sl := st_long
+    trail_stop := st_long
+if valid_entry_short
+    strategy.entry("S", strategy.short, qty=qty_short, comment="S")
+    entry_sl := st_short
+    trail_stop := st_short
+
+
+// === Trail update + TS exit (intra-bar) ===
+if in_long
+    new_stop = st_long
+    if not na(new_stop) and (na(trail_stop) or new_stop > trail_stop)
+        trail_stop := new_stop
+    strategy.exit("TS", "L", stop=trail_stop, comment="TS")
+else if in_short
+    new_stop = st_short
+    if not na(new_stop) and (na(trail_stop) or new_stop < trail_stop)
+        trail_stop := new_stop
+    strategy.exit("TS", "S", stop=trail_stop, comment="TS")
+
+
+// === OPP exit (raw opposite signal → execute on NEXT bar open) ===
+if in_long and raw_short
+    strategy.close("L", comment="OPP")
+if in_short and raw_long
+    strategy.close("S", comment="OPP")
+
+
+// === Track last exit bar (pentru cooldown post-EXIT) ===
+just_closed = (in_pos[1] and not in_pos)
+if just_closed
+    last_exit_bar := bar_index
+    trail_stop := na
+    entry_sl := na
+
+
+// ========== PLOTS ==========
+plot(baseline,                                      "McGinley",     color=color.new(color.yellow, 0), linewidth=2)
+plot(in_long  ? trail_stop : na,                    "Trail (Long)", color=color.new(color.lime, 0),   style=plot.style_linebr, linewidth=2)
+plot(in_short ? trail_stop : na,                    "Trail (Short)",color=color.new(color.red, 0),    style=plot.style_linebr, linewidth=2)
+plot(in_long  and not na(entry_sl) ? entry_sl : na, "Entry SL (L)", color=color.new(color.gray, 30),  style=plot.style_circles)
+plot(in_short and not na(entry_sl) ? entry_sl : na, "Entry SL (S)", color=color.new(color.gray, 30),  style=plot.style_circles)
+
+
+// ========== ALERTS ==========
+alertcondition(valid_entry_long,  title="VSE Long Entry",  message="VSE long on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(valid_entry_short, title="VSE Short Entry", message="VSE short on {{ticker}} {{interval}} @ {{close}}")
