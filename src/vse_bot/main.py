@@ -221,35 +221,39 @@ class SubaccountRunner:
 
     # ── Bar handling ─────────────────────────────────────────────────────
     async def on_bar(self, bar: dict[str, Any]) -> None:
-        """Apelat pe fiecare tick WS. Procesează doar bare CONFIRMED."""
-        if not bar.get("confirmed"):
-            return
-        # Pause flag: skip toate decizii (chart broadcast continuă în main flow)
-        if self.paused:
-            return
+        """Apelat pe fiecare tick WS Bybit (bare ÎN FORMARE + bare CONFIRMED).
+
+        Real-time chart: bara curentă (confirmed=False) e broadcast la chart
+        pentru update vizual tick-by-tick. Procesarea de strategy (signal,
+        cycle, trade) se face DOAR pe bare CONFIRMED.
+        """
         key = (bar["symbol"], bar["timeframe"])
         if key not in self.signals:
             return
 
-        # Chart broadcast — DOAR pe primary pair (regula 8+10).
-        # Timestamp Bybit e ms → convertim la SECUNDE pentru chart (regula 12).
         ts_s = int(bar["ts_ms"]) // 1000
+        confirmed = bool(bar.get("confirmed"))
+
+        # Chart broadcast — DOAR pe primary pair (regula 8+10).
+        # Pe bare neconfirmate: trimitem update real-time (chart desenează
+        # bara curentă în formare). Pe bare confirmed: append la candles_live.
         if key == self.primary_pair_key():
-            self.bot.mark_first_candle(ts_s)
-            candle_arr = [
-                ts_s,
-                round(bar["open"], 6),
-                round(bar["high"], 6),
-                round(bar["low"], 6),
-                round(bar["close"], 6),
-            ]
-            self.candles_live.append(candle_arr)
-            if len(self.candles_live) > 20000:
-                self.candles_live.pop(0)
             from vse_bot.chart_server import broadcast as _bc
+            if confirmed:
+                self.bot.mark_first_candle(ts_s)
+                candle_arr = [
+                    ts_s,
+                    round(bar["open"], 6),
+                    round(bar["high"], 6),
+                    round(bar["low"], 6),
+                    round(bar["close"], 6),
+                ]
+                self.candles_live.append(candle_arr)
+                if len(self.candles_live) > 20000:
+                    self.candles_live.pop(0)
             await _bc(self, {
                 "type": "candle",
-                "confirmed": True,
+                "confirmed": confirmed,
                 "data": {
                     "time": ts_s,
                     "open": bar["open"],
@@ -258,6 +262,12 @@ class SubaccountRunner:
                     "close": bar["close"],
                 },
             })
+
+        # Strategy processing DOAR pe bare CONFIRMED (signal, cycle, trade).
+        if not confirmed:
+            return
+        if self.paused:
+            return
 
         sig_engine = self.signals[key]
         ts = pd.Timestamp(bar["ts_ms"], unit="ms", tz="UTC")
