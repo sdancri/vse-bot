@@ -8,8 +8,11 @@
 //   - Style "Balanced": baseline + 2-of-3 + TTMS edge-trigger
 //   - Entry pe NEXT BAR OPEN (process_orders_on_close=false default)
 //   - TS exit intra-bar la trailing stop hit (strategy.exit stop=)
-//   - OPP exit la NEXT BAR OPEN pe opposite raw signal (strategy.close)
-//   - Cooldown 3 bars post-EXIT
+//   - OPP exit pe opposite raw signal:
+//       * Mode "pure" (default): close-only + cooldown 3 bars
+//       * Mode "with_reverse": close + immediate reverse pe direcție opusă
+//         (dacă SL bounds OK pentru noua direcție; altfel fallback close-only)
+//   - Cooldown 3 bars post-EXIT (NU se aplică la reverse)
 //   - Sizing: risk_usd = 20% × equity, pos = risk / sl_pct, capped 0.95 × equity × 20
 //   - Fees taker 0.055% (commission_value)
 //
@@ -64,6 +67,12 @@ g_size = "Sizing (match bot Nou1)"
 risk_pct       = input.float(0.20, "Risk % of equity", group=g_size, step=0.01)
 leverage       = input.int(20,    "Leverage", group=g_size)
 cap_pct_of_max = input.float(0.95, "Cap %% of max", group=g_size, step=0.01)
+
+g_exit = "OPP Exit Mode"
+opp_mode = input.string("pure", "OPP exit mode",
+     options=["pure", "with_reverse"], group=g_exit,
+     tooltip="pure: close-only, cooldown 3 bars before next entry. "
+           + "with_reverse: close + immediate reverse entry on same bar (if SL bounds OK).")
 
 
 // ========== 1. McGINLEY DYNAMIC ==========
@@ -223,13 +232,35 @@ else if in_short
 
 
 // === OPP exit (raw opposite signal → execute on NEXT bar open) ===
+// Mode "pure": close-only, then cooldown 3 bars.
+// Mode "with_reverse": close + immediate reverse entry pe direcție opusă, dacă
+// noua direcție trece SL bounds + indicators ready. Altfel fallback la close.
+//
+// Pine strategy.entry(opposite_side) reverse automat (close current + open new).
+new_dir_sl_ok_short = sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pct and st_short > close
+new_dir_sl_ok_long  = sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct and st_long  < close
+
 if in_long and raw_short
-    strategy.close("L", comment="OPP")
+    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_short
+        strategy.entry("S", strategy.short, qty=qty_short, comment="OPP→S")
+        entry_sl := st_short
+        trail_stop := st_short
+    else
+        strategy.close("L", comment="OPP")
+
 if in_short and raw_long
-    strategy.close("S", comment="OPP")
+    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_long
+        strategy.entry("L", strategy.long, qty=qty_long, comment="OPP→L")
+        entry_sl := st_long
+        trail_stop := st_long
+    else
+        strategy.close("S", comment="OPP")
 
 
 // === Track last exit bar (pentru cooldown post-EXIT) ===
+// just_closed = position closed natural (TS hit, OPP close, end of data).
+// Pe with_reverse, position rămâne open (reverse) → just_closed=false → cooldown
+// NU se actualizează (corect: reverse NU declanșează cooldown).
 just_closed = (in_pos[1] and not in_pos)
 if just_closed
     last_exit_bar := bar_index
