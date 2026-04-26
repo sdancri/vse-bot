@@ -31,9 +31,9 @@
 strategy(
      "VSE Balanced — verify (entries+exits)",
      overlay              = true,
-     initial_capital      = 100.0,
-     default_qty_type     = strategy.percent_of_equity,
-     default_qty_value    = 20,                     // 20% equity baseline; override via qty= per entry
+     initial_capital      = 50.0,                   // bot equity_start (NOT pool_total $100)
+     default_qty_type     = strategy.cash,
+     default_qty_value    = 1,                      // fallback (override via qty= la fiecare entry)
      pyramiding           = 0,
      process_orders_on_close = false,              // execută la NEXT BAR OPEN (match bot)
      commission_type      = strategy.commission.percent,
@@ -63,8 +63,10 @@ sl_min_pct  = input.float(0.005, "SL min %", group=g_filt, step=0.001)
 sl_max_pct  = input.float(0.035, "SL max %", group=g_filt, step=0.001)
 cooldown    = input.int(3,    "Cooldown bars (post-EXIT)", group=g_filt)
 
-// Sizing: 20% equity per trade (din strategy header default_qty_value=20).
-// Pentru cross-check timing-ul trade-urilor, NU sizing exact match.
+g_size = "Sizing (match bot Nou1: 20% × equity / sl_pct)"
+risk_pct       = input.float(0.20, "Risk %% of equity", group=g_size, step=0.01)
+leverage       = input.int(20,    "Leverage", group=g_size)
+cap_pct_of_max = input.float(0.95, "Cap %% of max", group=g_size, step=0.01)
 
 g_exit = "OPP Exit Mode"
 opp_mode = input.string("pure", "OPP exit mode",
@@ -193,21 +195,25 @@ sl_short_dist = (st_short - close) / close
 valid_entry_long  = raw_long  and not in_pos and cooldown_ok and indicators_ready and st_long  < close and sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct
 valid_entry_short = raw_short and not in_pos and cooldown_ok and indicators_ready and st_short > close and sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pct
 
-// === Sizing ===
-// Notă: Pine strategy() folosește default_qty_type=percent_of_equity (20%).
-// Bot-ul real face: pos = (risk × 100) / sl_pct cu cap 0.95 × equity × leverage.
-// Pentru CROSS-CHECK ENTRY TIMING, sizing exact NU contează — timing-ul
-// trade-urilor trebuie să match (entry/exit pe aceleași bare).
-// Dacă vrei PnL exact match, folosește scriptul Python replay.
+// === Sizing (match bot: pos = risk × 100 / sl_pct, capped 0.95 × equity × lev) ===
+risk_usd  = strategy.equity * risk_pct
+max_bybit = strategy.equity * leverage
+cap_value = cap_pct_of_max * max_bybit
+
+pos_long  = sl_long_dist  > 0 ? math.min(risk_usd / sl_long_dist,  cap_value) : 0.0
+pos_short = sl_short_dist > 0 ? math.min(risk_usd / sl_short_dist, cap_value) : 0.0
+
+qty_long  = close > 0 ? pos_long  / close : 0.0
+qty_short = close > 0 ? pos_short / close : 0.0
 
 
 // === ENTRY ===
-if valid_entry_long
-    strategy.entry("L", strategy.long, comment="L")
+if valid_entry_long and qty_long > 0
+    strategy.entry("L", strategy.long, qty=qty_long, comment="L")
     entry_sl := st_long
     trail_stop := st_long
-if valid_entry_short
-    strategy.entry("S", strategy.short, comment="S")
+if valid_entry_short and qty_short > 0
+    strategy.entry("S", strategy.short, qty=qty_short, comment="S")
     entry_sl := st_short
     trail_stop := st_short
 
@@ -235,16 +241,16 @@ new_dir_sl_ok_short = sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pc
 new_dir_sl_ok_long  = sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct and st_long  < close
 
 if in_long and raw_short
-    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_short
-        strategy.entry("S", strategy.short, comment="OPP→S")
+    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_short and qty_short > 0
+        strategy.entry("S", strategy.short, qty=qty_short, comment="OPP→S")
         entry_sl := st_short
         trail_stop := st_short
     else
         strategy.close("L", comment="OPP")
 
 if in_short and raw_long
-    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_long
-        strategy.entry("L", strategy.long, comment="OPP→L")
+    if opp_mode == "with_reverse" and indicators_ready and new_dir_sl_ok_long and qty_long > 0
+        strategy.entry("L", strategy.long, qty=qty_long, comment="OPP→L")
         entry_sl := st_long
         trail_stop := st_long
     else
