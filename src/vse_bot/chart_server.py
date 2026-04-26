@@ -54,13 +54,31 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
 
     @app.get("/api/init")
     async def api_init() -> JSONResponse:
-        """Init payload: candles + active position + bot state."""
+        """Init payload — schema match cu chart_live.html boilerplate."""
+        primary = runner.primary_pair_key()
+        symbol = primary[0] if primary else ""
+        bot_name = os.getenv("BOT_NAME", runner.sub_cfg.name)
+        bp = runner.bot.init_payload()
         return JSONResponse({
-            "subaccount": runner.sub_cfg.name,
-            "primary_pair": runner.primary_pair_key()[0] if runner.primary_pair_key() else "",
+            # Schema match chart_live.html
+            "symbol": symbol,
+            "timezone": "Europe/Bucharest",
+            "bot_name": bot_name,
+            "strategy": "VSE_Nou1",
             "candles": runner.candles_live,
+            "trades": bp["trades"],
+            "equity": bp["equity_curve"],
             "active_position": runner.active_position_payload(),
-            **runner.bot.init_payload(),
+            "first_ts": bp["first_candle_ts"],
+            "summary": {
+                **bp["summary"],
+                "initial_account": bp["initial_account"],
+            },
+            "indicators": [],
+            "indicator_meta": [],
+            # Extra fields pentru debug / API consumers
+            "subaccount": runner.sub_cfg.name,
+            "primary_pair": symbol,
         })
 
     @app.get("/api/status")
