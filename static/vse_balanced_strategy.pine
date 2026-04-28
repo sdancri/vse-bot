@@ -63,6 +63,11 @@ sl_min_pct  = input.float(0.005, "SL min %", group=g_filt, step=0.001)
 sl_max_pct  = input.float(0.035, "SL max %", group=g_filt, step=0.001)
 cooldown    = input.int(3,    "Cooldown bars (post-EXIT)", group=g_filt)
 
+g_dates = "Date Range"
+start_date = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Start", group=g_dates)
+end_date   = input.time(timestamp("01 Jan 2099 00:00 +0000"), "End",   group=g_dates)
+in_date_range = time >= start_date and time <= end_date
+
 // Sizing: 100% equity per trade (Pine default). Pentru CROSS-CHECK
 // ENTRY/EXIT TIMING; PnL absolut nu match bot exact (bot folosește
 // risk-based sizing cu compounding). Pentru PnL exact: scriptul Python.
@@ -191,8 +196,12 @@ indicators_ready = not na(atr_st) and not na(st_long) and not na(st_short)
 sl_long_dist  = (close - st_long)  / close
 sl_short_dist = (st_short - close) / close
 
-valid_entry_long  = raw_long  and not in_pos and cooldown_ok and indicators_ready and st_long  < close and sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct
-valid_entry_short = raw_short and not in_pos and cooldown_ok and indicators_ready and st_short > close and sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pct
+valid_entry_long  = raw_long  and not in_pos and cooldown_ok and indicators_ready and in_date_range and st_long  < close and sl_long_dist  >= sl_min_pct and sl_long_dist  <= sl_max_pct
+valid_entry_short = raw_short and not in_pos and cooldown_ok and indicators_ready and in_date_range and st_short > close and sl_short_dist >= sl_min_pct and sl_short_dist <= sl_max_pct
+
+// Close any open position when we leave the date range (avoid carrying state past end_date).
+if in_pos and not in_date_range
+    strategy.close_all(comment="DATE_END")
 
 // === ENTRY ===
 if valid_entry_long

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from vse_bot.config import StrategyConfig
 from vse_bot.cycle_manager import SubaccountState
@@ -65,6 +65,7 @@ async def open_trade_live(
     qty_step: float,
     qty_min: float,
     used_margin_other: float = 0.0,
+    notify: "Callable[[str, str], Awaitable[None]] | None" = None,
 ) -> LivePosition | None:
     """Plasează entry market + SL stop-market reduce-only.
 
@@ -175,7 +176,7 @@ async def open_trade_live(
     sl_dist = abs(actual_entry - signal.sl_price)
     actual_sl_pct = sl_dist / actual_entry if actual_entry > 0 else 0
     if actual_sl_pct < cfg.sl_min_pct or actual_sl_pct > cfg.sl_max_pct:
-        # Slippage scoate SL din bounds → close imediat
+        # Slippage scoate SL din bounds → close imediat (round-trip pe Bybit)
         close_side = "sell" if signal.side == "long" else "buy"
         await client.create_market_order(
             symbol=symbol, side=close_side, qty=actual_qty, reduce_only=True
@@ -184,17 +185,53 @@ async def open_trade_live(
             f"  [ORDER] {symbol} slippage out of bounds (sl_pct={actual_sl_pct:.4f}), "
             f"closed immediately"
         )
+        if notify is not None:
+            try:
+                await notify(
+                    f"⚠️ ENTRY ABORTED — slippage {symbol}",
+                    f"Side: <code>{signal.side.upper()}</code>\n"
+                    f"Entry fill: {actual_entry:.6f} (signal {signal.entry_price:.6f})\n"
+                    f"SL pct after fill: {actual_sl_pct * 100:.3f}% "
+                    f"(bounds {cfg.sl_min_pct * 100:.2f}–{cfg.sl_max_pct * 100:.2f}%)\n"
+                    f"Bybit round-trip executat (open + close imediat)."
+                )
+            except Exception as _e:
+                print(f"  [TG] notify failed: {_e}")
         return None
 
     # 2. Stop-market SL reduce-only (opposite side) cu qty REAL
     sl_side = "sell" if signal.side == "long" else "buy"
-    sl_order = await client.create_stop_market(
-        symbol=symbol,
-        side=sl_side,
-        qty=actual_qty,
-        stop_price=signal.sl_price,
-        reduce_only=True,
-    )
+    try:
+        sl_order = await client.create_stop_market(
+            symbol=symbol,
+            side=sl_side,
+            qty=actual_qty,
+            stop_price=signal.sl_price,
+            reduce_only=True,
+        )
+    except Exception as e:
+        # SL order eșuează → poziția deschisă pe Bybit FĂRĂ SL = critical.
+        # Close imediat (market reduce-only) și alert critic.
+        print(f"  [ORDER] {symbol} SL create FAILED: {e!r} — closing position")
+        try:
+            close_side = "sell" if signal.side == "long" else "buy"
+            await client.create_market_order(
+                symbol=symbol, side=close_side, qty=actual_qty, reduce_only=True
+            )
+        except Exception as e2:
+            print(f"  [ORDER] {symbol} CRITICAL — close after SL fail also failed: {e2!r}")
+        if notify is not None:
+            try:
+                await notify(
+                    f"🚨 CRITICAL — SL ORDER FAILED {symbol}",
+                    f"Side: <code>{signal.side.upper()}</code>\n"
+                    f"Entry: {actual_entry:.6f}  Qty: {actual_qty}\n"
+                    f"Eroare SL: <code>{type(e).__name__}: {str(e)[:200]}</code>\n"
+                    f"Poziția a fost ÎNCHISĂ market reduce-only. Verifică manual pe Bybit."
+                )
+            except Exception as _e:
+                print(f"  [TG] notify failed: {_e}")
+        return None
 
     return LivePosition(
         symbol=symbol,
