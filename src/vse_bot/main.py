@@ -258,12 +258,21 @@ class SubaccountRunner:
         # altfel append nou.
         if key == self.primary_pair_key():
             from vse_bot.chart_server import broadcast as _bc
+            # Auto-precision: ~5 cifre semnificative în funcție de magnitudine.
+            # Ex: 2300 → 2 zec, 95 → 3 zec, 0.07 → 6 zec. Aliniat cu fmtPx() chart.
+            import math as _math
+            ref = bar["close"] if bar.get("close") else 0
+            if ref > 0:
+                mag = _math.floor(_math.log10(ref))
+                _prec = max(2, min(8, 4 - mag))
+            else:
+                _prec = 6
             candle_arr = [
                 ts_s,
-                round(bar["open"], 6),
-                round(bar["high"], 6),
-                round(bar["low"], 6),
-                round(bar["close"], 6),
+                round(bar["open"], _prec),
+                round(bar["high"], _prec),
+                round(bar["low"], _prec),
+                round(bar["close"], _prec),
             ]
             if self.candles_live and self.candles_live[-1][0] == ts_s:
                 # Update bara curentă (acelaș timestamp = tick update)

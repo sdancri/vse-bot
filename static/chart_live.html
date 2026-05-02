@@ -265,7 +265,6 @@ let BOT_NAME  = "bot";
 let STRATEGY  = "";
 let SYMBOL    = "BTCUSDT";
 let TIMEFRAME = "";
-let TIMEFRAME = "";
 let INITIAL_ACCOUNT = 100.0;
 let FIRST_TS = null;        // s UTC — afisam doar lumanari >= asta
 let initDone = false;
@@ -273,14 +272,18 @@ let initDone = false;
 // ============================================================================
 // Bucharest formatters
 // ============================================================================
+const DAYS_RO_MAP = {
+  "Mon": "Luni",   "Tue": "Marti", "Wed": "Miercuri", "Thu": "Joi",
+  "Fri": "Vineri", "Sat": "Sambata", "Sun": "Duminica",
+};
 function fmtDateTZ(tsSec) {
-  const parts = new Intl.DateTimeFormat("ro-RO", {
-    timeZone: CHART_TZ, weekday: "long",
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: CHART_TZ, weekday: "short",
     day: "2-digit", month: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: false,
   }).formatToParts(new Date(tsSec * 1000));
   const m = {}; parts.forEach(p => m[p.type] = p.value);
-  const wd = (m.weekday || "").replace(/^./, ch => ch.toUpperCase());
+  const wd = DAYS_RO_MAP[m.weekday] || m.weekday || "";
   return `${wd}, ${m.day}.${m.month}.${m.year}  ${m.hour}:${m.minute}`;
 }
 function fmtTimeTZ(tsSec) {
@@ -422,28 +425,42 @@ let slLine = null, tpLine = null, entryLine = null;
 let slBoundedSer = null, tpBoundedSer = null;
 
 // ============================================================================
-// Live position lines (Entry / SL / TP)
+// Live position lines (Entry / SL / TP) — bounded de la entry pana la candle-ul curent
 // ============================================================================
 function clearLiveLines() {
-  if (liveSlLine)    { candleSeries.removePriceLine(liveSlLine);    liveSlLine = null; }
-  if (liveTpLine)    { candleSeries.removePriceLine(liveTpLine);    liveTpLine = null; }
-  if (liveEntryLine) { candleSeries.removePriceLine(liveEntryLine); liveEntryLine = null; }
+  for (const s of [liveEntryLine, liveSlLine, liveTpLine]) {
+    if (s) { try { chart.removeSeries(s); } catch(e){} }
+  }
+  liveEntryLine = liveSlLine = liveTpLine = null;
 }
 function showLiveLines(p) {
   clearLiveLines();
+  if (!p.entry_ms || !CANDLES.length) return;
+  const startTs = Math.floor(p.entry_ms / 1000);
+  const endTs   = CANDLES[CANDLES.length - 1].time;
+  if (endTs < startTs) return;
+
   const entryColor = p.direction === "LONG" ? "#00e676" : "#ff3352";
-  liveEntryLine = candleSeries.createPriceLine({
-    price: p.entry, color: entryColor, lineWidth: 2, lineStyle: 0,
-    axisLabelVisible: true, title: `LIVE ${p.direction}`
+  const mkSer = (color, title) => chart.addLineSeries({
+    color, lineWidth: 2, lineStyle: 0,
+    priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false,
+    title,
   });
-  liveSlLine = candleSeries.createPriceLine({
-    price: p.sl, color: "#ff3352", lineWidth: 2, lineStyle: 0,
-    axisLabelVisible: true, title: "LIVE SL"
-  });
-  liveTpLine = candleSeries.createPriceLine({
-    price: p.tp, color: "#00e676", lineWidth: 2, lineStyle: 0,
-    axisLabelVisible: true, title: "LIVE TP"
-  });
+  liveEntryLine = mkSer(entryColor, `LIVE ${p.direction}`);
+  liveSlLine    = mkSer("#ff3352",  "LIVE SL");
+  liveTpLine    = mkSer("#00e676",  "LIVE TP");
+  liveEntryLine.setData([{time: startTs, value: p.entry}, {time: endTs, value: p.entry}]);
+  liveSlLine   .setData([{time: startTs, value: p.sl},    {time: endTs, value: p.sl}]);
+  liveTpLine   .setData([{time: startTs, value: p.tp},    {time: endTs, value: p.tp}]);
+}
+function extendLiveLines(latestTs) {
+  if (!activePosition || !liveEntryLine || !activePosition.entry_ms) return;
+  const startTs = Math.floor(activePosition.entry_ms / 1000);
+  if (latestTs < startTs) return;
+  const p = activePosition;
+  liveEntryLine.setData([{time: startTs, value: p.entry}, {time: latestTs, value: p.entry}]);
+  liveSlLine   .setData([{time: startTs, value: p.sl},    {time: latestTs, value: p.sl}]);
+  liveTpLine   .setData([{time: startTs, value: p.tp},    {time: latestTs, value: p.tp}]);
 }
 
 // ============================================================================
@@ -535,6 +552,20 @@ function buildMarkers(filteredTrades) {
       });
     }
   });
+  // Active position — sageata live pe bara de entry
+  if (showE && activePosition && activePosition.entry_ms) {
+    const isL = activePosition.direction === "LONG";
+    const sizeUsd = (activePosition.qty || 0) * (activePosition.entry || 0);
+    const letter = isL ? "L" : "S";
+    mk.push({
+      time: Math.floor(activePosition.entry_ms / 1000),
+      position: isL ? "belowBar" : "aboveBar",
+      color:    isL ? "#00e676"  : "#ff3352",
+      shape:    isL ? "arrowUp"  : "arrowDown",
+      text: sizeUsd ? `${letter} $${sizeUsd.toFixed(0)}` : letter,
+      size: 2,
+    });
+  }
   mk.sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(mk);
 }
@@ -854,6 +885,7 @@ function connectWS() {
       if (c.low > 0) applyPricePrecision(c.low);
       document.getElementById("hdr-price").textContent = fmtPx(c.close);
       updateOpenPnl(c.close);
+      extendLiveLines(c.time);
 
     } else if (msg.type === "trade_closed") {
       trades.push(msg.trade);
@@ -880,17 +912,19 @@ function connectWS() {
     } else if (msg.type === "position_open") {
       activePosition = {
         direction: msg.direction, entry: msg.entry, sl: msg.sl, tp: msg.tp,
-        qty: msg.qty, risk_usd: msg.risk_usd,
+        qty: msg.qty, risk_usd: msg.risk_usd, entry_ms: msg.entry_ms,
       };
       showLiveLines(activePosition);
       renderDetail(activePosition, true);
       updateOpenPnl(lastPrice);
+      buildMarkers(filteredTrades());
 
     } else if (msg.type === "position_close") {
       activePosition = null;
       clearLiveLines();
       renderDetail(null, false);
       updateOpenPnl(0);
+      buildMarkers(filteredTrades());
     }
   };
 }

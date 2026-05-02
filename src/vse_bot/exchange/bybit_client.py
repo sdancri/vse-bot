@@ -294,27 +294,39 @@ class BybitClient:
         if settle_delay_sec > 0:
             await asyncio.sleep(settle_delay_sec)
 
+        import time as _time
         start_ms = entry_ts_ms - 60_000
-        end_limit_ms = exit_ts_ms + 120_000
+        # end_limit larg: fie 5min după exit, fie now+1min — whichever larger.
+        # Bybit înregistrează closed-pnl cu lag până la câteva minute, mai ales
+        # pe perechi cu volume mic; window strâns ratează entry-ul.
+        end_limit_ms = max(exit_ts_ms + 300_000, int(_time.time() * 1000) + 60_000)
 
-        # Bybit V5 closed-pnl endpoint via ccxt private call
         params = {"category": "linear", "symbol": symbol, "limit": 50,
                   "startTime": str(start_ms)}
-        try:
-            r = await self.exchange.private_get_v5_position_closed_pnl(params)
-            records = (r.get("result") or {}).get("list", []) if r else []
-        except Exception as e:
-            print(f"  [BYBIT] fetch_pnl_for_trade error: {e}")
-            return {"pnl": 0.0, "fees": 0.0, "n_fills": 0,
-                    "avg_entry": 0.0, "avg_exit": 0.0, "raw": []}
+        # Retry 3× cu backoff (2s/5s/10s) dacă relevant=[] — Bybit poate înregistra
+        # closed-pnl cu delay; aboard prematur lasă pnl=0 fals (port boilerplate).
+        retry_delays = [0, 2, 5, 10]
+        records: list = []
+        relevant: list = []
+        for delay in retry_delays:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                r = await self.exchange.private_get_v5_position_closed_pnl(params)
+                records = (r.get("result") or {}).get("list", []) if r else []
+            except Exception as e:
+                print(f"  [BYBIT] fetch_pnl_for_trade error (retry={delay}s): {e}")
+                continue
+            relevant = [
+                rec for rec in records
+                if start_ms <= int(rec.get("updatedTime", 0)) <= end_limit_ms
+            ]
+            if relevant:
+                break
 
-        relevant = [
-            r for r in records
-            if start_ms <= int(r.get("updatedTime", 0)) <= end_limit_ms
-        ]
         if not relevant:
             print(f"  [BYBIT] WARNING: niciun closed-pnl pentru trade "
-                  f"{entry_ts_ms}-{exit_ts_ms}")
+                  f"{entry_ts_ms}-{exit_ts_ms} după {len(retry_delays)} retry")
             return {"pnl": 0.0, "fees": 0.0, "n_fills": 0,
                     "avg_entry": 0.0, "avg_exit": 0.0, "raw": []}
 
