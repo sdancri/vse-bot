@@ -172,14 +172,15 @@ class SubaccountRunner:
         await self._reconcile_with_bybit()
 
     async def _reconcile_with_bybit(self) -> None:
-        """Detectează poziții / ordine reziduale pe Bybit (de la crash anterior).
+        """Detectează poziții / ordine reziduale pe Bybit.
 
         Reguli:
-          - Orice poziție deschisă pe Bybit pe perechi monitorizate → PAUSED.
-          - Orice order deschis (SL stop_market sau limit) → PAUSED.
-          - Cazul critic: position fără SL → ALERT CRITIC + PAUSED.
-
-        Default state pe mismatch: PAUSED (NU auto-recovery — manual review).
+          - Position fără SL → CRITIC + PAUSED.
+          - Position + SL (state mismatch local) → PAUSED (manual review).
+          - NO position + ordine deschise (orphan SL/limit) → AUTO-CLEANUP
+            (cancel orders + continue), NU pause. Cazul tipic: SL trigger sau
+            OPP close — poziția e închisă, dar SL-ul/order-ul rămâne uneori
+            "open" pe Bybit. Safe să cancel.
         """
         residue: list[str] = []
         for pair in self.sub_cfg.pairs:
@@ -209,10 +210,27 @@ class SubaccountRunner:
                     f"sl_orders={len(sl_orders)}, other={len(other_orders)}"
                 )
             elif sl_orders or other_orders:
-                residue.append(
-                    f"{sym}: NO position dar {len(sl_orders)} SL + "
-                    f"{len(other_orders)} alte ordine deschise"
+                # AUTO-CLEANUP: orphan orders fără poziție corespondentă —
+                # cancel toate (safe: nu mai există nimic de protejat).
+                cancelled = 0
+                failed = 0
+                for o in sl_orders + other_orders:
+                    try:
+                        await self.client.cancel_order(sym, o["id"])
+                        cancelled += 1
+                    except Exception as e:
+                        failed += 1
+                        print(f"  [RECONCILE] cancel orphan {sym} {o.get('id')[:8]} fail: {e}")
+                print(
+                    f"  [RECONCILE] {sym}: orphan orders auto-cleanup — "
+                    f"cancelled={cancelled} failed={failed} (NO position, safe)"
                 )
+                log_event(
+                    self.cfg.operational.log_dir, self.sub_cfg.name,
+                    "RECONCILE_ORPHAN_CLEANED",
+                    symbol=sym, cancelled=cancelled, failed=failed,
+                )
+                # NB: nu adăugăm la residue → NU pause
 
         if residue:
             self.paused = True
