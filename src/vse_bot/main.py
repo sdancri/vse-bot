@@ -503,7 +503,21 @@ class SubaccountRunner:
             # poziția încă deschisă — ignore
             return
 
-        # Position size = 0 → trade closed pe Bybit. Trage PnL real.
+        # Position size = 0 → trade closed pe Bybit (SL hit, manual close, sau
+        # liquidare). Cancel proactiv SL-ul rămas — dacă era SL hit (bot detect),
+        # SL-ul e deja "Filled" și cancel returnează error (prinse silent).
+        # Dacă close-ul a venit de la altă sursă (manual UI, liquidare), SL-ul
+        # poate fi încă "open" → orphan dacă nu cancel.
+        if pos.order_sl_id:
+            try:
+                await self.client.cancel_order(symbol, pos.order_sl_id)
+            except Exception as e:
+                # SL deja consumed (Filled) — case normal pe SL hit.
+                msg = str(e).lower()
+                if "already" not in msg and "not exists" not in msg and "not found" not in msg:
+                    print(f"  [POSITION_CLOSE] cancel SL {symbol} fail: {e}")
+
+        # Trage PnL real.
         entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
         exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
         pnl_data = await self.client.fetch_pnl_for_trade(
